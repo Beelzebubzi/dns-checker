@@ -1,0 +1,375 @@
+#!/bin/zsh
+# Check DNS records from the terminal.
+#   dns -a example.com
+emulate -R zsh
+setopt nounset
+
+typeset -g bold= dim= red= green= cyan= reset=
+
+if [[ -t 1 ]]; then
+  bold=$'\033[1m'
+  dim=$'\033[2m'
+  red=$'\033[31m'
+  green=$'\033[32m'
+  cyan=$'\033[36m'
+  reset=$'\033[0m'
+fi
+
+usage() {
+  cat <<'EOF'
+usage: dns [-a|-aaaa|-mx|-ns|-txt|-cname|-soa|-ptr|-caa|-all] [-s server] domain
+
+Check DNS records for a domain.
+
+  -a       A records (IPv4)
+  -aaaa    AAAA records (IPv6)
+  -mx      MX records
+  -ns      NS records
+  -txt     TXT records
+  -cname   CNAME records
+  -soa     SOA records
+  -ptr     PTR records (pass an IP address)
+  -caa     CAA records
+  -all     A, AAAA, CNAME, MX, NS, TXT, and SOA
+  -s HOST  query this DNS server, for example 1.1.1.1
+
+With no record flag, A records are checked.
+
+examples:
+  dns -a example.com
+  dns -mx example.com
+  dns -a -aaaa example.com
+  dns -all example.com
+  dns -a example.com -s 1.1.1.1
+  dns -ptr 1.1.1.1
+EOF
+}
+
+die() {
+  print -r -- "dns: $1" >&2
+  exit 2
+}
+
+fmt_ttl() {
+  local s=$1
+  local -a parts
+  local amount
+  if (( s >= 86400 )); then
+    amount=$((s / 86400))
+    parts+=("${amount}d")
+    s=$((s % 86400))
+  fi
+  if (( s >= 3600 )); then
+    amount=$((s / 3600))
+    parts+=("${amount}h")
+    s=$((s % 3600))
+  fi
+  if (( s >= 60 )); then
+    amount=$((s / 60))
+    parts+=("${amount}m")
+    s=$((s % 60))
+  fi
+  if (( s > 0 || ${#parts} == 0 )); then
+    parts+=("${s}s")
+  fi
+  print -r -- "${(j: :)parts}"
+}
+
+status_color() {
+  case $1 in
+    NOERROR) print -r -- "$green" ;;
+    *) print -r -- "$red" ;;
+  esac
+}
+
+# Sets owner, ttl, rdtype, and data from one dig answer line.
+split_record() {
+  local -a fields
+  fields=(${=1})
+  if (( $#fields < 5 )); then
+    return 1
+  fi
+  if [[ ${fields[3]} != IN ]]; then
+    return 1
+  fi
+  owner=${fields[1]}
+  ttl=${fields[2]}
+  rdtype=${fields[4]}
+  data=${(j: :)fields[5,-1]}
+  [[ $ttl == <-> ]] || return 1
+}
+
+query_type() {
+  local qtype=$1 name=$2
+  local -a cmd
+  local output rc line in_answer
+  local -a lines
+
+  cmd=(dig +time=3 +tries=1)
+  if [[ -n $server ]]; then
+    cmd+=("@${server}")
+  fi
+  if [[ $qtype == PTR ]]; then
+    cmd+=(-x "$name")
+  else
+    cmd+=("$name" "$qtype")
+  fi
+
+  output=$("${cmd[@]}" 2>&1)
+  rc=$?
+
+  rec_status[$qtype]="UNKNOWN"
+  rec_time[$qtype]=""
+  rec_server[$qtype]=""
+  rec_error[$qtype]=""
+  rec_lines[$qtype]=""
+  lines=()
+  in_answer=0
+
+  while IFS= read -r line; do
+    if [[ $line == *"status: "* ]]; then
+      rec_status[$qtype]=${${line##*status: }%%,*}
+      rec_status[$qtype]=${rec_status[$qtype]// /}
+    elif [[ $line == ";; ANSWER SECTION:" ]]; then
+      in_answer=1
+    elif [[ $line == ";; Query time:"* ]]; then
+      rec_time[$qtype]=${${line#;; Query time: }%% *}
+      in_answer=0
+    elif [[ $line == ";; SERVER:"* ]]; then
+      rec_server[$qtype]=${${line#;; SERVER: }%%#*}
+      in_answer=0
+    elif (( in_answer )); then
+      if [[ -z $line || $line == ";;"* ]]; then
+        in_answer=0
+      else
+        lines+=("$line")
+      fi
+    elif [[ $line == *"timed out"* || $line == *"no servers could be reached"* || $line == *"communications error"* ]]; then
+      rec_error[$qtype]=${line#;; }
+      rec_error[$qtype]=${rec_error[$qtype]# }
+    fi
+  done <<< "$output"
+
+  if (( $#lines )); then
+    rec_lines[$qtype]=${(F)lines}
+  fi
+
+  if (( rc != 0 )); then
+    if [[ -z ${rec_error[$qtype]} ]]; then
+      rec_error[$qtype]=${output%%$'\n'*}
+      if [[ -z ${rec_error[$qtype]} ]]; then
+        rec_error[$qtype]="lookup failed"
+      fi
+    fi
+    if [[ ${rec_status[$qtype]} == UNKNOWN ]]; then
+      rec_status[$qtype]="TIMEOUT"
+    fi
+  fi
+}
+
+same_owner() {
+  local left=${1%.}
+  local right=${2%.}
+  [[ ${(L)left} == ${(L)right} ]]
+}
+
+print_records() {
+  local qtype=$1 raw=$2
+  local line owner ttl rdtype data pretty same=1
+  local -a lines
+  lines=("${(@f)raw}")
+
+  # PTR answers live at the reverse name, so show the target on its own.
+  if [[ $qtype != PTR ]]; then
+    for line in "${lines[@]}"; do
+      split_record "$line" || continue
+      if [[ $rdtype != "$qtype" ]] || ! same_owner "$owner" "$domain"; then
+        same=0
+        break
+      fi
+    done
+  fi
+
+  for line in "${lines[@]}"; do
+    split_record "$line" || continue
+    pretty=$(fmt_ttl "$ttl")
+    if (( same )); then
+      print -r -- "  ${bold}${data}${reset}  ${dim}${pretty}${reset}"
+    else
+      print -r -- "  ${owner}  ${cyan}${rdtype}${reset}  ${bold}${data}${reset}  ${dim}${pretty}${reset}"
+    fi
+  done
+}
+
+print_type() {
+  local qtype=$1
+  local color time_bit server_bit
+  color=$(status_color "${rec_status[$qtype]}")
+  time_bit=""
+  server_bit=""
+  if [[ -n ${rec_time[$qtype]} ]]; then
+    time_bit="  ${dim}${rec_time[$qtype]}ms${reset}"
+  fi
+  if [[ -n ${rec_server[$qtype]} && ${rec_server[$qtype]} != "$header_server" ]]; then
+    server_bit="  ${dim}via ${rec_server[$qtype]}${reset}"
+  elif [[ -n ${rec_server[$qtype]} && $#types -eq 1 ]]; then
+    server_bit="  ${dim}via ${rec_server[$qtype]}${reset}"
+  fi
+
+  if (( $#types == 1 )); then
+    print -r -- "${bold}${display_name}${reset}  ${cyan}${qtype}${reset}  ${color}${rec_status[$qtype]}${reset}${time_bit}${server_bit}"
+  else
+    print -r -- "${cyan}${qtype}${reset}  ${color}${rec_status[$qtype]}${reset}${time_bit}${server_bit}"
+  fi
+
+  if [[ -n ${rec_lines[$qtype]} ]]; then
+    print_records "$qtype" "${rec_lines[$qtype]}"
+  elif [[ -n ${rec_error[$qtype]} ]]; then
+    print -r -- "  ${dim}${rec_error[$qtype]}${reset}"
+  elif [[ ${rec_status[$qtype]} == NOERROR ]]; then
+    print -r -- "  ${dim}no ${qtype} records${reset}"
+  fi
+}
+
+type_failed() {
+  local qtype=$1
+  case ${rec_status[$qtype]} in
+    NOERROR)
+      if (( all_mode == 0 )) && [[ -z ${rec_lines[$qtype]} ]]; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+main() {
+  local -a types
+  local server="" domain="" all_mode=0
+  local -A rec_status rec_time rec_server rec_error rec_lines
+  local display_name header_server qtype failed
+
+  types=()
+  while (( $# )); do
+    case $1 in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -all)
+        all_mode=1
+        shift
+        ;;
+      -a) types+=(A); shift ;;
+      -aaaa) types+=(AAAA); shift ;;
+      -mx) types+=(MX); shift ;;
+      -ns) types+=(NS); shift ;;
+      -txt) types+=(TXT); shift ;;
+      -cname) types+=(CNAME); shift ;;
+      -soa) types+=(SOA); shift ;;
+      -ptr) types+=(PTR); shift ;;
+      -caa) types+=(CAA); shift ;;
+      -s|--server)
+        (( $# >= 2 )) || die "option $1 needs a DNS server"
+        server=$2
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "unknown option: $1 (try --help)"
+        ;;
+      *)
+        if [[ -n $domain ]]; then
+          die "unexpected argument: $1"
+        fi
+        domain=$1
+        shift
+        ;;
+    esac
+  done
+
+  if (( $# )); then
+    if [[ -n $domain ]]; then
+      die "unexpected argument: $1"
+    fi
+    domain=$1
+    shift
+    if (( $# )); then
+      die "unexpected argument: $1"
+    fi
+  fi
+
+  if [[ -z $domain ]]; then
+    usage >&2
+    exit 2
+  fi
+  if [[ $domain == *[[:space:]]* ]]; then
+    die "invalid domain: $domain"
+  fi
+
+  if [[ -n $server ]]; then
+    server=${server#@}
+    if [[ ! $server =~ '^[A-Za-z0-9.:%_-]+$' ]]; then
+      die "invalid DNS server: $server"
+    fi
+    if [[ $server == *:* && $server != \[*\] ]]; then
+      server="[$server]"
+    fi
+  fi
+
+  if (( all_mode )); then
+    types=(A AAAA CNAME MX NS TXT SOA)
+  elif (( $#types == 0 )); then
+    types=(A)
+  fi
+
+  if ! command -v dig >/dev/null 2>&1; then
+    print -r -- "dns: dig is required, and it ships with macOS." >&2
+    exit 127
+  fi
+
+  display_name=${domain%.}
+  for qtype in "${types[@]}"; do
+    query_type "$qtype" "$domain"
+  done
+
+  header_server=""
+  for qtype in "${types[@]}"; do
+    if [[ -n ${rec_server[$qtype]} ]]; then
+      header_server=${rec_server[$qtype]}
+      break
+    fi
+  done
+
+  if (( $#types > 1 )); then
+    if [[ -n $header_server ]]; then
+      print -r -- "${bold}${display_name}${reset}  ${dim}via ${header_server}${reset}"
+    else
+      print -r -- "${bold}${display_name}${reset}"
+    fi
+    print
+  fi
+
+  failed=0
+  local i=0
+  for qtype in "${types[@]}"; do
+    if (( $#types > 1 && i > 0 )); then
+      print
+    fi
+    print_type "$qtype"
+    if type_failed "$qtype"; then
+      failed=1
+    fi
+    i=$((i + 1))
+  done
+
+  exit "$failed"
+}
+
+main "$@"
